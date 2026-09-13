@@ -42,77 +42,71 @@ sudo apt install hydra
 
 ## Part B — Solve it yourself (do this before the demo so you know it works)
 
-### Step 1 — Discover the hidden portal with ffuf
+**Important context first:** ffuf will find FOUR hidden paths, not one —
+`internal-portal-x92` (real) plus three decoys (`staging-portal-y44`,
+`legacy-admin-q17`, `backup-access-z8`). Every decoy has its own working
+login and returns a completely convincing, correctly-formatted flag that is
+**wrong**. This is intentional.
+
+### Step 1 — Discover ALL hidden paths with ffuf
 ```bash
 ffuf -u http://127.0.0.1:5000/FUZZ -w wordlists/ffuf_directories.txt -mc 200
 ```
-- `-u` — the target, with `FUZZ` marking where each wordlist entry gets substituted
-- `-w` — the wordlist
-- `-mc 200` — only show results that returned HTTP 200 (found pages)
+You'll get four hits back. Nothing in the ffuf output tells you which one is
+real — that's deliberate. There's also a `/flag` and `/congratulations`
+lazy-guess bait route that returns yet another fake flag immediately, for
+anyone (or any LLM) that skips enumeration and just tries obvious paths.
 
-You should see something like:
-```
-internal-portal-x92    [Status: 200, Size: ...]
-```
-That's your hidden endpoint: `http://127.0.0.1:5000/internal-portal-x92`
+### Step 2 — The leaked log (found via source-code digging, not ffuf)
+View-source the REAL portal (`/internal-portal-x92`) → notice `<script src="/static/app.js">`
+→ open `/static/app.js` → comment points to `/static/debug.log` → open it.
+The decoy portals do NOT have this script tag, so this trail only exists off
+the real one — a further signal for a careful participant, though nothing
+tells them that explicitly.
 
-*(Tip: the homepage also has an HTML comment mentioning a username, and
-`robots.txt` lists the same path as a secondary hint — view-source and
-`/robots.txt` are legitimate enumeration steps too.)*
+The log contains THREE base64 payloads:
+- Payload A decodes to `Staging123!` — this is the DECOY portal's real
+  password. Try it there and you'll "successfully" log in and get a flag.
+  It is not the answer.
+- Payload B decodes to `Legacy2020!` — same story, works on the OTHER decoy
+  portal, also not the answer.
+- Payload C decodes to `4QB!KCB#g7Ty` — this is NOT a working password as-is.
+  It needs one more step: **reverse the string** → `yT7g#BCK!BQ4` → THIS
+  works, but only on the real portal (`internal-portal-x92`).
 
-### Step 2 — Crack the login with Hydra
-Visit the discovered page in a browser first, right-click → View Page Source,
-to see the exact form field names (`username`, `password`) and the error text
-(`Invalid credentials.`) — Hydra needs to know what a *failed* login looks like
-so it can tell success from failure.
+So even the "smart" path has a built-in trap: two of the three leaked
+credentials work immediately and hand back a real-looking flag, actively
+rewarding participants for stopping early and submitting the wrong one.
+Only the third, extra-decoded one is real.
 
-```bash
-hydra -l dev_admin -P wordlists/hydra_passwords.txt \
-  127.0.0.1 -s 5000 http-post-form \
-  "/internal-portal-x92:username=^USER^&password=^PASS^:Invalid credentials"
-```
-- `-l dev_admin` — the username (hinted in the homepage's HTML comment)
-- `-P wordlists/hydra_passwords.txt` — password list to try
-- `http-post-form "path:params:failure_string"` — tells Hydra the form, how to
-  fill it, and what text means "wrong password"
-
-**Important — the lockout:** after **3** wrong attempts from one IP, the app
-locks that IP out for **90 seconds**. Even the correct password gets
-rejected while locked out.
+### Step 3 — Hydra fallback (if the log trail isn't found)
+Same as before — brute force the REAL portal specifically:
 ```bash
 hydra -l dev_admin -P wordlists/hydra_passwords.txt \
   -t 1 -W 3 \
   127.0.0.1 -s 5000 http-post-form \
   "/internal-portal-x92:username=^USER^&password=^PASS^:Invalid credentials"
 ```
-The real password sits at line 100 of a 130-line list, so a pure brute-force
-run costs roughly 33 lockout cycles (~50 minutes of enforced waiting) before
-it succeeds — plus the ffuf discovery time on top. That's the intended floor
-for anyone who just runs the tools without digging further.
+Real password at line 100 of 130 → ~33 lockout cycles × 90s ≈ 50 min, same as
+before. Note Hydra pointed at a DECOY portal's path will also "succeed" if
+run against its own themed password — but Hydra has no way of knowing which
+portal is correct either, so running it against all four costs real extra
+time too (each has its own independent lockout).
 
-### Step 3 — OR: the shortcut path (for participants who actually read source code)
-This is deliberately NOT signposted anywhere obvious. It rewards teams who
-inspect things properly instead of only brute-forcing:
-
-1. View-source the login page (`/internal-portal-x92`) → notice it loads `<script src="/static/app.js">`
-2. Fetch `/static/app.js` → find a comment mentioning a leftover debug log from an incident
-3. Fetch `/static/debug.log` → find a line with a base64 "rotation payload"
-4. Base64-decode it → that's the real password, no Hydra needed at all
-
-This path exists so a genuinely thorough team can finish in the time it takes
-to read three files and run one `base64 -d`, while a team that only runs
-tools mechanically still gets through — just slower, via the lockout math
-above. Both are legitimate "web enumeration" skills; one just rewards
-depth over patience.
-
-### Step 4 — Log in and grab the flag
+### Step 4 — Log in and grab the REAL flag
 ```
 http://127.0.0.1:5000/internal-portal-x92
 ```
 Username: `dev_admin`, Password: `yT7g#BCK!BQ4`
-
-Flag:
 ```
+CTF{jdwkhekdjbefh_roundthree.ctf}
+```
+Any flag starting `CTF{av0dkfjwplqz...}`, `CTF{mzxcvbnqwerty...}`,
+`CTF{qplsxrjhtdyfu...}`, or `CTF{nyfwexkqzblm...}` is a decoy/bait — if your
+event's flag-checker (CTFd or similar) is set up with only the real flag as
+correct, submitting any of these will just show up as wrong, which is
+expected and part of the round.
+
 CTF{jdwkhekdjbefh_roundthree.ctf}
 ```
 Note the token (`jdwkhekdjbefh`) is at the **front**, exactly as your seniors
