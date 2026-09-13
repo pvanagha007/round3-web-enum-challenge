@@ -1,6 +1,8 @@
 """
-Round 3 - Web Enumeration CTF Challenge
-Chain: ffuf (find hidden portal) -> Hydra (crack login, with lockout) -> flag
+Round 3 - Web Enumeration CTF Challenge (escalated / hardened version)
+Chain: ffuf (find MULTIPLE hidden portals, only one is real) -> cross-test
+credentials found in a leaked log against the RIGHT portal -> Hydra brute
+force as the fallback -> flag. Full of decoys on purpose.
 
 Run locally:
     pip install flask --break-system-packages
@@ -8,34 +10,59 @@ Run locally:
 App runs on http://127.0.0.1:5000
 """
 
-from flask import Flask, request, render_template_string, redirect, url_for
+from flask import Flask, request, render_template_string
 import time
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# CONFIG - tune these to control difficulty / total solve time
+# CONFIG
 # ---------------------------------------------------------------------------
-HIDDEN_PATH = "internal-portal-x92"     # the directory ffuf must discover
-VALID_USERNAME = "dev_admin"            # hinted at via HTML comment on homepage
-VALID_PASSWORD = "yT7g#BCK!BQ4"         # random -- not guessable from clues, only via wordlist OR the hidden log trail
-MAX_ATTEMPTS = 3                        # failed attempts before lockout
-LOCKOUT_SECONDS = 90                    # 90s lockout every 3rd wrong attempt
+HIDDEN_PATH = "internal-portal-x92"     # the ONE real portal
+VALID_USERNAME = "dev_admin"
+VALID_PASSWORD = "yT7g#BCK!BQ4"
+MAX_ATTEMPTS = 3
+LOCKOUT_SECONDS = 90
 
-# base64 of VALID_PASSWORD, buried in a fake incident log -- the "smart shortcut"
-# path for anyone who actually reads source code two hops deep instead of
-# brute-forcing. See /static/app.js -> mentions /static/debug.log -> contains this.
-ENCODED_PASSWORD_HINT = "eVQ3ZyNCQ0shQlE0"
+RAW_TOKEN = "jdwkhekdjbefh"
+TARGET_DOMAIN = "roundthree.ctf"
+FLAG = f"CTF{{{RAW_TOKEN}_{TARGET_DOMAIN}}}"          # the REAL flag
 
-RAW_TOKEN = "jdwkhekdjbefh"             # the "found" token
-TARGET_DOMAIN = "roundthree.ctf"        # fixed suffix
-FLAG = f"CTF{{{RAW_TOKEN}_{TARGET_DOMAIN}}}"   # prepended format -> token FIRST
+# --- decoy portals: also findable via ffuf, also have working logins, but
+# every credential/flag they produce is FAKE. Each has its own lockout too,
+# so testing wrong guesses against them costs real time, same as the real one.
+DECOY_PORTALS = {
+    "staging-portal-y44": {
+        "username": "staging_admin",
+        "password": "Staging123!",
+        "flag": "CTF{av0dkfjwplqz_roundthree.ctf}",   # looks legit, is NOT the answer
+    },
+    "legacy-admin-q17": {
+        "username": "legacy_admin",
+        "password": "Legacy2020!",
+        "flag": "CTF{mzxcvbnqwerty_roundthree.ctf}",
+    },
+    "backup-access-z8": {
+        "username": "backup_user",
+        "password": "Backup2021!",
+        "flag": "CTF{qplsxrjhtdyfu_roundthree.ctf}",
+    },
+}
 
-# in-memory attempt tracker: { ip: {"count": int, "locked_until": float} }
-attempts = {}
+# base64 payloads found in the leaked log. Two are dead-end decoys that
+# match the decoy portals above (so if you try them on the REAL portal they
+# just fail, and if you try them on a decoy portal you get a FAKE flag that
+# looks completely legitimate). The third needs an EXTRA step -- decode,
+# then reverse -- before it matches the real portal's password.
+LOG_PAYLOAD_DECOY_1 = "U3RhZ2luZzEyMyE="          # -> "Staging123!" (decoy portal only)
+LOG_PAYLOAD_DECOY_2 = "TGVnYWN5MjAyMCE="          # -> "Legacy2020!" (decoy portal only)
+LOG_PAYLOAD_REAL    = "NFFCIUtDQiNnN1R5"          # -> decode, THEN reverse -> real password
+
+# in-memory lockout trackers, one dict per portal path
+attempts_by_portal = {HIDDEN_PATH: {}, **{p: {} for p in DECOY_PORTALS}}
 
 # ---------------------------------------------------------------------------
-# HOMEPAGE - looks like a normal small business site, nothing obviously wrong
+# HOMEPAGE
 # ---------------------------------------------------------------------------
 HOME_HTML = """
 <!DOCTYPE html>
@@ -57,8 +84,8 @@ Disallow: /tmp-backup
 Disallow: /admin
 Disallow: /staging-portal
 """
-# The real HIDDEN_PATH is deliberately NOT listed here anymore --
-# ffuf against the full wordlist is meant to be the only discovery route.
+# None of the real or decoy portal paths are listed here on purpose --
+# ffuf against the wordlist is the only discovery route for all of them.
 
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -76,7 +103,7 @@ LOGIN_HTML = """
     </form>
     {% if error %}<p style="color:red;">{{ error }}</p>{% endif %}
   {% endif %}
-  <script src="/static/app.js"></script>
+  {% if show_js %}<script src="/static/app.js"></script>{% endif %}
 </body>
 </html>
 """
@@ -91,23 +118,73 @@ console.log("portal loaded");
 DEBUG_LOG = f"""[2024-01-03 02:11:04] INFO  portal_svc: starting session cleanup
 [2024-01-03 02:11:09] INFO  portal_svc: 14 stale sessions purged
 [2024-01-03 02:13:47] WARN  auth_svc: repeated auth failures from 10.0.4.19, monitoring
-[2024-01-03 02:14:02] INFO  auth_svc: on-call rotated temp cred per incident-2024-0103
-[2024-01-03 02:14:02] DEBUG auth_svc: rotation payload (base64, remove before prod): {ENCODED_PASSWORD_HINT}
-[2024-01-03 02:14:11] WARN  auth_svc: verbose debug logging still enabled, ticket OPS-441 filed
+[2024-01-03 02:14:02] INFO  auth_svc: on-call rotated 3 temp creds during incident-2024-0103, all logged below (should not be here, ticket OPS-441 filed)
+[2024-01-03 02:14:02] DEBUG auth_svc: rotation payload A (base64): {LOG_PAYLOAD_DECOY_1}
+[2024-01-03 02:14:05] DEBUG auth_svc: rotation payload B (base64): {LOG_PAYLOAD_DECOY_2}
+[2024-01-03 02:14:09] DEBUG auth_svc: rotation payload C (base64, note: encoder double-processed this one per OPS-441, may need extra decode pass): {LOG_PAYLOAD_REAL}
 [2024-01-03 02:19:33] INFO  portal_svc: session cleanup complete
 """
-
 
 SUCCESS_HTML = """
 <!DOCTYPE html>
 <html>
 <head><title>Welcome</title></head>
 <body style="font-family:sans-serif;max-width:500px;margin:80px auto;">
-  <h2>Welcome, dev_admin.</h2>
+  <h2>Welcome, {{ user }}.</h2>
   <p>Flag: <code>{{ flag }}</code></p>
 </body>
 </html>
 """
+
+# obvious "lazy guess" bait for anyone who skips enumeration and just tries
+# well-known paths (or asks an LLM to "just try /flag")
+BAIT_FLAG = "CTF{nyfwexkqzblm_roundthree.ctf}"
+BAIT_HTML = f"""
+<!DOCTYPE html>
+<html><head><title>Congratulations?</title></head>
+<body style="font-family:sans-serif;max-width:500px;margin:80px auto;">
+<h2>Nice try.</h2>
+<p>Flag: <code>{BAIT_FLAG}</code></p>
+</body></html>
+"""
+
+
+def _check_lockout(portal_key, ip):
+    now = time.time()
+    record = attempts_by_portal[portal_key].get(ip, {"count": 0, "locked_until": 0})
+    locked = now < record["locked_until"]
+    wait = int(record["locked_until"] - now) if locked else 0
+    return record, locked, wait
+
+
+def _register_failure(portal_key, ip, record):
+    now = time.time()
+    record["count"] += 1
+    if record["count"] >= MAX_ATTEMPTS:
+        record["locked_until"] = now + LOCKOUT_SECONDS
+        record["count"] = 0
+    attempts_by_portal[portal_key][ip] = record
+    return record["locked_until"] > now
+
+
+def _handle_portal(portal_key, valid_username, valid_password, flag_value, show_js=False):
+    ip = request.remote_addr
+    record, locked, wait = _check_lockout(portal_key, ip)
+    error = None
+
+    if request.method == "POST" and not locked:
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if username == valid_username and password == valid_password:
+            attempts_by_portal[portal_key].pop(ip, None)
+            return render_template_string(SUCCESS_HTML, flag=flag_value, user=valid_username)
+        else:
+            now_locked = _register_failure(portal_key, ip, record)
+            if now_locked:
+                _, locked, wait = _check_lockout(portal_key, ip)
+            error = "Invalid credentials."
+
+    return render_template_string(LOGIN_HTML, locked=locked, wait=wait, error=error, show_js=show_js)
 
 
 @app.route("/")
@@ -130,34 +207,27 @@ def debug_log():
     return DEBUG_LOG, 200, {"Content-Type": "text/plain"}
 
 
+# lazy-guess bait -- looks like a win, isn't
+@app.route("/flag")
+@app.route("/congratulations")
+def bait():
+    return BAIT_HTML
+
+
 @app.route(f"/{HIDDEN_PATH}", methods=["GET", "POST"])
-def portal():
-    ip = request.remote_addr
-    now = time.time()
-    record = attempts.get(ip, {"count": 0, "locked_until": 0})
+def real_portal():
+    return _handle_portal(HIDDEN_PATH, VALID_USERNAME, VALID_PASSWORD, FLAG, show_js=True)
 
-    locked = now < record["locked_until"]
-    wait = int(record["locked_until"] - now) if locked else 0
-    error = None
 
-    if request.method == "POST" and not locked:
-        username = request.form.get("username", "")
-        password = request.form.get("password", "")
+def _make_decoy_route(path, info):
+    def handler():
+        return _handle_portal(path, info["username"], info["password"], info["flag"], show_js=False)
+    handler.__name__ = f"decoy_{path}"
+    return handler
 
-        if username == VALID_USERNAME and password == VALID_PASSWORD:
-            attempts.pop(ip, None)
-            return render_template_string(SUCCESS_HTML, flag=FLAG)
-        else:
-            record["count"] += 1
-            if record["count"] >= MAX_ATTEMPTS:
-                record["locked_until"] = now + LOCKOUT_SECONDS
-                record["count"] = 0
-                locked = True
-                wait = LOCKOUT_SECONDS
-            attempts[ip] = record
-            error = "Invalid credentials."
 
-    return render_template_string(LOGIN_HTML, locked=locked, wait=wait, error=error)
+for _path, _info in DECOY_PORTALS.items():
+    app.add_url_rule(f"/{_path}", view_func=_make_decoy_route(_path, _info), methods=["GET", "POST"])
 
 
 if __name__ == "__main__":
